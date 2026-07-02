@@ -1,0 +1,620 @@
+---
+title: "Modeling Click-Through Rate and Conversion Probability 
+        in Online Advertising "
+author: "Yunseo Chang"
+date: "2026-01-22"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+rm(list=ls())
+setwd('C:\\융융\\2025\\교환 준비\\수업 서류\\통계적 추론\\project')
+library(readr)
+library(dplyr)
+library(summarytools)
+library(boot)
+library(pROC)
+library(ggplot2)
+library(car)
+library(margins)
+library(effects)
+#install.packages("ISLR")
+library(ISLR)
+#install.packages("glmnet")
+library(glmnet)
+library(MASS)
+library("e1071")
+#install.packages("glmnetUtils")
+library(glmnetUtils)
+
+```
+
+# 1. Data Description
+
+This study uses online advertising log data provided by Criteo. Each observation corresponds to a single ad impression event.
+
+Read the Criteo data
+
+```{r load_data}
+df = read.csv('criteo_sample2.csv')
+```
+
+Data Consists of 10000 observations on 22 variables
+
+```{r}
+dim(df)
+str(df)
+```
+
+```{r}
+head(df)
+```
+
+Missing values were examined across all variables, and no missing observations were found in the dataset.
+
+```{r}
+sum(is.na(df))
+```
+
+# 2. Train- Test data Split
+
+Since the dataset exhibits time-series characteristics due to the inclusion of the timestamp variable, the data are split chronologically, with the first 70% used as the training set and the remaining 30% as the test set.
+
+```{r}
+n <- nrow(df)
+split_idx <- floor(0.7 * n)
+
+df_train <- df[1:split_idx, ]
+df_test  <- df[(split_idx + 1):n, ]
+```
+
+```{r}
+str(df_train)
+```
+
+```{r}
+summary(df_train)
+str(df_train)
+```
+
+```{r}
+print(dfSummary(df_train, method='render'))
+
+```
+
+The dataset consists of impression-level advertising logs, including time information, user and campaign identifiers, binary click and conversion outcomes, cost variables, and high-cardinality categorical features. Since many variables are identifiers rather than true numeric quantities, appropriate type conversion and feature engineering are required, and the temporal structure motivates a chronological train--test split.
+
+# 3. Data Preprocessing
+
+Before fitting each model, a set of basic preprocessing steps is performed. All preprocessing steps are performed based on the training data, and the same procedures are consistently applied to the test data.
+
+## 3.1 Type Conversion
+
+```{r}
+# Train 
+df_train$conversion    <- as.factor(df_train$conversion)
+df_train$attribution   <- as.factor(df_train$attribution)
+df_train$click         <- as.factor(df_train$click)
+df_train$campaign      <- as.factor(df_train$campaign)
+df_train$uid           <- as.factor(df_train$uid)
+df_train$conversion_id <- as.factor(df_train$conversion_id)
+
+cat_vars <- paste0("cat", 1:9)
+df_train[cat_vars] <- lapply(df_train[cat_vars], as.factor)
+
+df_train$timestamp <- as.numeric(df_train$timestamp)
+
+# Test
+df_test$conversion    <- as.factor(df_test$conversion)
+df_test$attribution   <- as.factor(df_test$attribution)
+df_test$click         <- as.factor(df_test$click)
+df_test$campaign      <- as.factor(df_test$campaign)
+df_test$uid           <- as.factor(df_test$uid)
+df_test$conversion_id <- as.factor(df_test$conversion_id)
+
+df_test[cat_vars] <- lapply(df_test[cat_vars], as.factor)
+df_test$timestamp <- as.numeric(df_test$timestamp)
+
+```
+
+## 3.2 Click History Variables
+
+Since ' time_since_last_click' jointly encodes the existence of prior click experience and the elapsed time since the last click, we split this variable to separately capture these two effects.
+
+```{r}
+
+#Train
+df_train$has_prev_click <- as.factor(df_train$time_since_last_click != -1)
+
+df_train$tslc <- ifelse(
+  df_train$time_since_last_click == -1,
+  0,
+  df_train$time_since_last_click
+)
+
+# Test 
+df_test$has_prev_click <- as.factor(df_test$time_since_last_click != -1)
+df_test$tslc <- ifelse(df_test$time_since_last_click == -1, 0, df_test$time_since_last_click)
+```
+
+# 4.CTR Train Preprocessing
+
+## 4.1 CTR data construction
+
+CTR focuses on click at the impression level, excluding post-conversion variables.
+
+```{r}
+
+head(df_train,10)
+
+df_CTR<-subset(df_train, select = c(-uid, -conversion_timestamp, -conversion_id, -cpo ,-conversion, -attribution,-click_pos,-click_nb,-time_since_last_click))
+
+
+
+# Check 
+str(df_CTR)
+```
+
+## 4.2 CTR EDA
+
+Although the dataset exhibits only mild class imbalance, simple accuracy can be misleading, as high accuracy may be achieved by favoring the majority class.
+
+Therefore, we rely on threshold-independent metrics such as the ROC curve and AUC, since model performance in logistic regression depends on the choice of the decision threshold.
+
+```{r}
+# Distribution of Click Outcome
+
+ggplot(df_CTR, aes(x = click)) +
+  geom_bar(fill = "gray80", color = "white") +
+  labs(
+    title = "Distribution of Click Outcome",
+    x = "Click (0 = No, 1 = Yes)",
+    y = "Count"
+  ) +
+  theme_bw() +
+  theme(
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.border = element_blank()   
+  )
+
+
+```
+
+```{r}
+# Click Rate by Previous Click History
+
+ggplot(df_CTR, aes(x = has_prev_click, fill = click)) +
+  geom_bar(position = "fill", color = "white") +
+  scale_x_discrete(
+    labels = c(
+      "FALSE" = "No",
+      "TRUE"  = "Yes"
+    )
+  ) +
+  scale_fill_manual(
+    values = c(
+      "0" = "#D9DAD7",
+      "1" = "#6FA8A6"
+    ),
+    labels = c("No Click", "Click"),
+    name = "Click"
+  ) +
+  labs(
+    title = "Click Rate by Previous Click History",
+    x = "Has Previous Click",
+    y = "Proportion"
+  ) +
+  scale_y_continuous(labels = scales::percent) +
+  theme_bw() +
+  theme(
+    panel.grid = element_blank(),
+    legend.position = "top",
+    panel.border = element_blank()
+  )
+
+
+```
+
+```{r fig_cost_compare, echo=FALSE}
+
+# Cost Distribution
+ggplot(df_CTR, aes(x = cost)) +
+  geom_histogram(bins = 40, fill = "gray80", color = 'white') +
+  labs(
+    title = "Cost Distribution",
+    x = "Cost",
+    y = "Frequency"
+  ) +
+  theme_minimal() +
+  theme(
+    panel.grid.major = element_blank(),  
+    panel.grid.minor = element_blank()  
+  )
+
+
+
+```
+
+```{r}
+pairs(df_CTR[, c( "cost", "tslc","timestamp")])
+```
+
+These exploratory findings motivate the inclusion of previous click history, cost, and temporal variables in the subsequent logistic regression models.
+
+## 4.3 CTR feature engineering
+
+### 4.3.1 Campaign cumulative exposure
+
+Rather than treating the campaign variable as a static categorical feature, we introduce a cumulative campaign count to capture the dynamic effect of repeated exposure over time
+
+```{r}
+df_CTR <- df_CTR %>%
+  arrange(timestamp) %>%
+  mutate(campaign_cumcnt = ave(rep(1L, n()), campaign, FUN = cumsum) - 1L)
+
+summary(df_CTR$campaign_cumcnt)
+```
+
+```{r}
+
+# campaign_cumcnt  
+par(mfrow=c(1,2))
+
+library(ggplot2)
+
+ggplot(df_CTR, aes(x = campaign_cumcnt)) +
+  geom_histogram(
+    bins = 40,
+    fill = "gray80",
+    color = 'white'            
+  ) +
+  labs(
+    title = "Distribution of Cumulative Campaign Exposure",
+    x = "Cumulative Campaign Count",
+    y = "Frequency"
+  ) +
+  theme_bw() +
+  theme(
+    panel.grid = element_blank(),
+    panel.border = element_blank()
+  )
+
+
+```
+
+### 4.3.2 Count encoding for cat1--cat9 (train-based)
+
+Given that the categorical variables cat1--cat9 lack semantic interpretation, we adopt count encoding to convert them into numerical features suitable for regression modeling.
+
+```{r}
+count_encode <- function(x) {
+  tab <- table(x)
+  as.numeric(tab[x])
+}
+
+for (cc in cat_vars) {
+  df_CTR[[paste0(cc, "_cnt")]] <- count_encode(df_CTR[[cc]])
+}
+```
+
+### 4.3.3 Log transforms
+
+```{r}
+
+df_CTR$campaign_cumcnt_log <- log1p(df_CTR$campaign_cumcnt)
+df_CTR$tslc_log <- log1p(df_CTR$tslc)
+df_CTR$cost_log <- log1p(df_CTR$cost)
+
+
+```
+
+```{r}
+
+# campaign_cumcnt_log 그래프  알아보기 
+par(mfrow=c(1,2))
+
+
+ggplot(df_CTR, aes(x = campaign_cumcnt)) +
+  geom_histogram(
+    bins = 40,
+    fill = "gray80",
+    color = 'white'            
+  ) +
+  labs(
+    title = "Distribution of Cumulative Campaign Exposure",
+    x = "Cumulative Campaign Count",
+    y = "Frequency"
+  ) +
+  theme_bw() +
+  theme(
+    panel.grid = element_blank(),
+    panel.border = element_blank()
+  )
+
+
+ggplot(df_CTR, aes(x = campaign_cumcnt_log)) +
+  geom_histogram(
+    bins = 40,
+    fill = "gray80",
+    color = 'white'            
+  ) +
+  labs(
+    title = "Distribution of Log Cumulative Campaign Exposure",
+    x = "Log sclae of Cumulative Campaign Count",
+    y = "Frequency"
+  ) +
+  theme_bw() +
+  theme(
+    panel.grid = element_blank(),
+    panel.border = element_blank()
+  )
+
+
+```
+
+# 5. CTR test preprocessing
+
+```{r}
+
+# data constuction
+
+df_CTR_test<-subset(df_test,  select=c(-uid, -conversion_timestamp, -conversion_id, -cpo,
+         -conversion, -attribution, -click_pos, -click_nb,
+         -time_since_last_click))
+
+
+# Campaign cumulative exposure
+
+df_CTR_test$campaign <- factor(df_CTR_test$campaign, levels = levels(df_CTR$campaign))
+df_CTR_test$has_prev_click <- factor(df_CTR_test$has_prev_click, levels = levels(df_CTR$has_prev_click))
+
+for (cc in cat_vars) {
+  df_CTR_test[[cc]] <- factor(df_CTR_test[[cc]], levels = levels(df_CTR[[cc]]))
+}
+
+# campaign_cumcnt in test
+df_CTR_test$campaign_cumcnt <- ave(rep(1L, nrow(df_CTR_test)),
+                                   df_CTR_test$campaign, FUN = cumsum) - 1L
+
+# train-based count maps
+make_count_tab <- function(x_factor_train) table(x_factor_train)
+lookup_count <- function(x_factor_test, tab) {
+  out <- as.numeric(tab[as.character(x_factor_test)])
+  out[is.na(out)] <- 0
+  out
+}
+
+cat_tabs_CTR <- lapply(df_CTR[cat_vars], make_count_tab)
+names(cat_tabs_CTR) <- cat_vars
+
+for (cc in cat_vars) {
+  df_CTR_test[[paste0(cc, "_cnt")]] <- lookup_count(df_CTR_test[[cc]], cat_tabs_CTR[[cc]])
+}
+
+# logs
+df_CTR_test$campaign_cumcnt_log <- log1p(df_CTR_test$campaign_cumcnt)
+df_CTR_test$tslc_log <- log1p(df_CTR_test$tslc)
+df_CTR_test$cost_log <- log1p(df_CTR_test$cost)
+```
+
+# 6. CTR Modeling and Model selection
+
+As the dependent variable is binary, classification models such as logistic regression, Linear Discriminant Analysis (LDA), and Quadratic Discriminant Analysis (QDA), Naive Bayes Classification are considered.
+
+We evaluate and compare their predictive performance to identify the most effective model for the classification task
+
+## 6.1 Logistic regression
+
+```{r}
+mod_ctr_baseline <- glm(
+  click ~ cost_log + has_prev_click + tslc_log + campaign_cumcnt_log +
+    cat1_cnt + cat2_cnt + cat3_cnt + cat4_cnt + cat5_cnt +
+    cat6_cnt + cat7_cnt + cat8_cnt + cat9_cnt,
+  data = df_CTR,
+  family = binomial
+)
+
+summary(mod_ctr_baseline)
+
+```
+
+## 6.2 LDA
+
+```{r}
+
+lda.fit<- lda(click ~ cost_log + has_prev_click + tslc_log + campaign_cumcnt_log +
+    cat1_cnt + cat2_cnt + cat3_cnt + cat4_cnt + cat5_cnt +
+    cat6_cnt + cat7_cnt + cat8_cnt + cat9_cnt, data = df_CTR)
+
+lda.fit
+
+```
+
+```{r}
+lda.preds <- predict(lda.fit, newdata = df_CTR_test)
+head(lda.preds$class)
+
+```
+
+## 6.3 QDA
+
+```{r}
+qda.fit <- qda(click ~ cost_log + has_prev_click + tslc_log + campaign_cumcnt_log +
+                 cat1_cnt + cat2_cnt + cat3_cnt + cat4_cnt + cat5_cnt +
+                 cat6_cnt + cat7_cnt + cat8_cnt + cat9_cnt,
+               data = df_CTR)
+
+qda.fit
+
+```
+
+```{r}
+
+qda.preds <- predict(qda.fit, newdata = df_CTR_test)
+
+```
+
+## 6.4 NB
+
+```{r}
+library(e1071)
+
+nb.fit <- naiveBayes(
+  click ~ cost_log + has_prev_click + tslc_log + campaign_cumcnt_log +
+    cat1_cnt + cat2_cnt + cat3_cnt + cat4_cnt + cat5_cnt +
+    cat6_cnt + cat7_cnt + cat8_cnt + cat9_cnt,
+  data = df_CTR
+)
+
+nb.fit
+
+```
+
+```{r}
+nb.preds <- predict(nb.fit,
+                    newdata = df_CTR_test,
+                    type = "raw") 
+head(nb.preds)
+nb.prob <- nb.preds[, "1"]
+```
+
+# 7. Model selection
+
+AUC is used as the primary evaluation metric because it provides a threshold-independent measure of discriminative performance, which is particularly suitable under class imbalance.
+
+## 7.1 Test AUC
+
+```{r}
+
+# Logistic regression 
+
+prob_ctr_test <- predict(mod_ctr_baseline, newdata = df_CTR_test, type = "response")
+roc_ctr <- roc(df_CTR_test$click, prob_ctr_test)
+auc(roc_ctr)
+
+
+# LDA 
+lda.roc <- roc(df_CTR_test$click ~ lda.preds$posterior[, "1"],
+               plot = TRUE, print.auc = TRUE)
+
+auc(lda.roc)
+
+
+# QDA
+qda.roc <- roc(df_CTR_test$click ~ qda.preds$posterior[, "1"],
+               plot = TRUE, print.auc = TRUE)
+
+auc(qda.roc)
+
+
+# NB
+nb.roc <- roc(df_CTR_test$click ~ nb.prob,
+              plot = TRUE,
+              print.auc = TRUE)
+
+auc(nb.roc)
+```
+
+```{r}
+
+auc_logit  <- auc(roc_ctr)
+auc_lda    <- auc(lda.roc)
+auc_qda    <- auc(qda.roc)
+auc_nb     <- auc(nb.roc)
+
+data.frame(
+  Model = c("Logistic", "LDA", "QDA", "Naive Bayes"),
+  AUC   = c(auc_logit, auc_lda, auc_qda, auc_nb)
+)
+
+```
+
+Model performance was evaluated using the Area Under the Receiver Operating Characteristic Curve (AUC) which provides a threshold-independent measure of discriminative ability. The estimated AUC values were 0.688 for logistic regression, 0.670 for LDA, 0.649 for QDA, and 0.628 for Naive Bayes. Among the considered models, logistic regression achieved the highest AUC, indicating superior discriminatory performance on the test set. Although the differences are moderate in magnitude, the results suggest that logistic regression provides the most effective balance between predictive accuracy and model interpretability in this setting. Therefore, logistic regression is selected as the primary modeling framework for subsequent analysis.
+
+# 8. Logistic Regression
+
+## 8.1 Lasso
+
+```{r}
+library(glmnetUtils)
+
+
+cvfit <- cv.glmnet(click ~  cost_log + has_prev_click + tslc_log + campaign_cumcnt_log +
+    cat1_cnt + cat2_cnt + cat3_cnt + cat4_cnt + cat5_cnt +
+    cat6_cnt + cat7_cnt + cat8_cnt + cat9_cnt, data = df_CTR,
+                   family = "binomial", alpha = 1)
+
+best.lambda <- cvfit$lambda.1se
+best.lambda
+coef(cvfit, s = best.lambda)
+```
+
+```{r}
+# Lasso plot 
+plot(cvfit)
+abline(v = log(best.lambda), lty = "dashed")
+
+```
+
+```{r}
+final_model <- glm(
+  click ~ cost_log + tslc_log + cat1_cnt + cat3_cnt + cat5_cnt + cat9_cnt,
+  data = df_CTR,
+  family = binomial
+)
+
+
+summary(final_model)
+margins(final_model)
+```
+
+## 8.1.2 Test AUC
+
+```{r}
+
+# Lasso
+lasso.prob <- predict(cvfit,
+                      newdata = df_CTR_test,
+                      s = best.lambda,
+                      type = "response")
+lasso.prob <- as.numeric(lasso.prob)
+
+roc_lasso <- roc(df_CTR_test$click ~ lasso.prob,
+                 plot = TRUE,
+                 print.auc = TRUE)
+
+auc_lasso <- as.numeric(auc(roc_lasso))
+auc_lasso
+
+
+
+
+data.frame(
+  Model = c("Logistic", "LASSO"),
+  AUC   = c(auc_logit, auc_lasso)
+)
+
+```
+
+```{r}
+vif(mod_ctr_baseline)
+vif(final_model)
+```
+
+# 9. Marginal Effects & Interpretation
+
+```{r}
+
+margins(final_model)
+
+```
+
+The average marginal effects indicate that time since last click significantly reduces click probability, supporting a recency mechanism in user behavior. Among categorical frequency variables, cat3_cnt shows a small but positive contribution to click likelihood, while cat5_cnt and cat9_cnt exhibit weak negative effects. The marginal effect of advertising cost appears numerically large due to scaling, reflecting the strong association between cost and click probability in the model
+
+# 10. Conclusion
+
+```{r}
+summary(final_model)
+```

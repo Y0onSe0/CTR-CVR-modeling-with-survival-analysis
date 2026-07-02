@@ -1,0 +1,14 @@
+data/
+*.csv
+*.RData
+*.Rhistory
+*.html
+*.docx
+*.pdf
+제출용/
+제안서.docx
+영어 보고서.pdf
+한글 보고서.docx
+프로젝트 설명.pdf
+__pycache__/
+.Rproj.user/

@@ -1,0 +1,651 @@
+---
+title: "Modeling Click-Through Rate and Conversion Probability 
+        in Online Advertising "
+author: "Yunseo Chang"
+date: "2026-01-22"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(readr)
+library(dplyr)
+library(summarytools)
+library(boot)
+library(pROC)
+library(ggplot2)
+library(car)
+library(margins)
+library(effects)
+
+```
+
+# 1. Data Description
+
+This study uses online advertising log data provided by Criteo. Each observation corresponds to a single ad impression event.
+
+Read the Criteo data
+
+```{r load_data}
+df = read.csv('criteo_sample2.csv')
+```
+
+Data Consists of 10000 observations on 22 variables
+
+```{r}
+dim(df)
+```
+
+```{r}
+head(df)
+```
+
+Missing values were examined across all variables, and no missing observations were found in the dataset.
+
+```{r}
+sum(is.na(df))
+```
+
+# 2. Train- Test data Split
+
+Since the dataset exhibits time-series characteristics due to the inclusion of the timestamp variable, the data are split chronologically, with the first 70% used as the training set and the remaining 30% as the test set.
+
+```{r}
+n <- nrow(df)
+split_idx <- floor(0.7 * n)
+
+df_train <- df[1:split_idx, ]
+df_test  <- df[(split_idx + 1):n, ]
+```
+
+```{r}
+str(df_train)
+```
+
+```{r}
+summary(df_train)
+str(df_train)
+```
+
+```{r}
+print(dfSummary(df_train, method='render'))
+
+```
+
+The dataset consists of impression-level advertising logs, including time information, user and campaign identifiers, binary click and conversion outcomes, cost variables, and high-cardinality categorical features. Since many variables are identifiers rather than true numeric quantities, appropriate type conversion and feature engineering are required, and the temporal structure motivates a chronological train--test split.
+
+# 3. Data Preprocessing
+
+Before fitting each model, a set of basic preprocessing steps is performed. All preprocessing steps are performed based on the training data, and the same procedures are consistently applied to the test data.
+
+## 3.1 Type Conversion
+
+```{r}
+# Train 
+df_train$conversion    <- as.factor(df_train$conversion)
+df_train$attribution   <- as.factor(df_train$attribution)
+df_train$click         <- as.factor(df_train$click)
+df_train$campaign      <- as.factor(df_train$campaign)
+df_train$uid           <- as.factor(df_train$uid)
+df_train$conversion_id <- as.factor(df_train$conversion_id)
+
+cat_vars <- paste0("cat", 1:9)
+df_train[cat_vars] <- lapply(df_train[cat_vars], as.factor)
+
+df_train$timestamp <- as.numeric(df_train$timestamp)
+
+# Test
+df_test$conversion    <- as.factor(df_test$conversion)
+df_test$attribution   <- as.factor(df_test$attribution)
+df_test$click         <- as.factor(df_test$click)
+df_test$campaign      <- as.factor(df_test$campaign)
+df_test$uid           <- as.factor(df_test$uid)
+df_test$conversion_id <- as.factor(df_test$conversion_id)
+
+df_test[cat_vars] <- lapply(df_test[cat_vars], as.factor)
+df_test$timestamp <- as.numeric(df_test$timestamp)
+
+```
+
+## 3.2 Click History Variables
+
+Since ' time_since_last_click' jointly encodes the existence of prior click experience and the elapsed time since the last click, we split this variable to separately capture these two effects.
+
+```{r}
+
+#Train
+df_train$has_prev_click <- as.factor(df_train$time_since_last_click != -1)
+
+df_train$tslc <- ifelse(
+  df_train$time_since_last_click == -1,
+  0,
+  df_train$time_since_last_click
+)
+
+# Test 
+df_test$has_prev_click <- as.factor(df_test$time_since_last_click != -1)
+df_test$tslc <- ifelse(df_test$time_since_last_click == -1, 0, df_test$time_since_last_click)
+```
+
+# 4.CTR Train Preprocessing
+
+## 4.1 CTR data construction
+
+CTR focuses on click at the impression level, excluding post-conversion variables.
+
+```{r}
+
+df_CTR <- df_train %>%
+  select(-uid,-conversion_timestamp,-conversion_id,-cpo ,-conversion, -attribution,-click_pos,-click_nb,-time_since_last_click)
+
+# Check 
+str(df_CTR)
+```
+
+## 4.2 CTR EDA
+
+Although the dataset exhibits only mild class imbalance, simple accuracy can be misleading, as high accuracy may be achieved by favoring the majority class.
+
+Therefore, we rely on threshold-independent metrics such as the ROC curve and AUC, since model performance in logistic regression depends on the choice of the decision threshold.
+
+```{r}
+# Distribution of Click Outcome
+
+ggplot(df_CTR, aes(x = click)) +
+  geom_bar(fill = "gray80", color = "white") +
+  labs(
+    title = "Distribution of Click Outcome",
+    x = "Click (0 = No, 1 = Yes)",
+    y = "Count"
+  ) +
+  theme_bw() +
+  theme(
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.border = element_blank()   
+  )
+
+
+```
+
+```{r}
+# Click Rate by Previous Click History
+
+ggplot(df_CTR, aes(x = has_prev_click, fill = click)) +
+  geom_bar(position = "fill", color = "white") +
+  scale_x_discrete(
+    labels = c(
+      "FALSE" = "No",
+      "TRUE"  = "Yes"
+    )
+  ) +
+  scale_fill_manual(
+    values = c(
+      "0" = "#D9DAD7",
+      "1" = "#6FA8A6"
+    ),
+    labels = c("No Click", "Click"),
+    name = "Click"
+  ) +
+  labs(
+    title = "Click Rate by Previous Click History",
+    x = "Has Previous Click",
+    y = "Proportion"
+  ) +
+  scale_y_continuous(labels = scales::percent) +
+  theme_bw() +
+  theme(
+    panel.grid = element_blank(),
+    legend.position = "top",
+    panel.border = element_blank()
+  )
+
+
+```
+
+```{r fig_cost_compare, echo=FALSE}
+
+# Cost Distribution
+ggplot(df_CTR, aes(x = cost)) +
+  geom_histogram(bins = 40, fill = "gray80", color = 'white') +
+  labs(
+    title = "Cost Distribution",
+    x = "Cost",
+    y = "Frequency"
+  ) +
+  theme_minimal() +
+  theme(
+    panel.grid.major = element_blank(),  
+    panel.grid.minor = element_blank()  
+  )
+
+
+
+```
+
+
+```{r}
+pairs(df_CTR[, c( "cost", "tslc","timestamp")])
+```
+These exploratory findings motivate the inclusion of previous click history, cost, and temporal variables in the subsequent logistic regression models.
+
+## 4.3 CTR feature engineering
+
+### 4.3.1 Campaign cumulative exposure
+
+Rather than treating the campaign variable as a static categorical feature, we introduce a cumulative campaign count to capture the dynamic effect of repeated exposure over time
+
+```{r}
+df_CTR <- df_CTR %>%
+  arrange(timestamp) %>%
+  mutate(campaign_cumcnt = ave(rep(1L, n()), campaign, FUN = cumsum) - 1L)
+
+summary(df_CTR$campaign_cumcnt)
+```
+
+```{r}
+
+# campaign_cumcnt  
+par(mfrow=c(1,2))
+
+library(ggplot2)
+
+ggplot(df_CTR, aes(x = campaign_cumcnt)) +
+  geom_histogram(
+    bins = 40,
+    fill = "gray80",
+    color = 'white'            
+  ) +
+  labs(
+    title = "Distribution of Cumulative Campaign Exposure",
+    x = "Cumulative Campaign Count",
+    y = "Frequency"
+  ) +
+  theme_bw() +
+  theme(
+    panel.grid = element_blank(),
+    panel.border = element_blank()
+  )
+
+
+```
+
+### 4.3.2 Count encoding for cat1--cat9 (train-based)
+
+Given that the categorical variables cat1--cat9 lack semantic interpretation, we adopt count encoding to convert them into numerical features suitable for regression modeling.
+
+```{r}
+count_encode <- function(x) {
+  tab <- table(x)
+  as.numeric(tab[x])
+}
+
+for (cc in cat_vars) {
+  df_CTR[[paste0(cc, "_cnt")]] <- count_encode(df_CTR[[cc]])
+}
+```
+
+### 4.3.3 Log transforms
+
+```{r}
+
+df_CTR$campaign_cumcnt_log <- log1p(df_CTR$campaign_cumcnt)
+df_CTR$tslc_log <- log1p(df_CTR$tslc)
+df_CTR$cost_log <- log1p(df_CTR$cost)
+
+
+```
+
+```{r}
+
+# campaign_cumcnt_log 그래프  알아보기 
+par(mfrow=c(1,2))
+
+
+ggplot(df_CTR, aes(x = campaign_cumcnt)) +
+  geom_histogram(
+    bins = 40,
+    fill = "gray80",
+    color = 'white'            
+  ) +
+  labs(
+    title = "Distribution of Cumulative Campaign Exposure",
+    x = "Cumulative Campaign Count",
+    y = "Frequency"
+  ) +
+  theme_bw() +
+  theme(
+    panel.grid = element_blank(),
+    panel.border = element_blank()
+  )
+
+
+ggplot(df_CTR, aes(x = campaign_cumcnt_log)) +
+  geom_histogram(
+    bins = 40,
+    fill = "gray80",
+    color = 'white'            
+  ) +
+  labs(
+    title = "Distribution of Log Cumulative Campaign Exposure",
+    x = "Log sclae of Cumulative Campaign Count",
+    y = "Frequency"
+  ) +
+  theme_bw() +
+  theme(
+    panel.grid = element_blank(),
+    panel.border = element_blank()
+  )
+
+
+```
+
+# 5. CTR test preprocessing
+
+```{r}
+
+# data constuction
+df_CTR_test <- df_test %>%
+  select(-uid, -conversion_timestamp, -conversion_id, -cpo,
+         -conversion, -attribution, -click_pos, -click_nb,
+         -time_since_last_click) %>%
+  arrange(timestamp)
+
+# Campaign cumulative exposure
+
+df_CTR_test$campaign <- factor(df_CTR_test$campaign, levels = levels(df_CTR$campaign))
+df_CTR_test$has_prev_click <- factor(df_CTR_test$has_prev_click, levels = levels(df_CTR$has_prev_click))
+
+for (cc in cat_vars) {
+  df_CTR_test[[cc]] <- factor(df_CTR_test[[cc]], levels = levels(df_CTR[[cc]]))
+}
+
+# campaign_cumcnt in test
+df_CTR_test$campaign_cumcnt <- ave(rep(1L, nrow(df_CTR_test)),
+                                   df_CTR_test$campaign, FUN = cumsum) - 1L
+
+# train-based count maps
+make_count_tab <- function(x_factor_train) table(x_factor_train)
+lookup_count <- function(x_factor_test, tab) {
+  out <- as.numeric(tab[as.character(x_factor_test)])
+  out[is.na(out)] <- 0
+  out
+}
+
+cat_tabs_CTR <- lapply(df_CTR[cat_vars], make_count_tab)
+names(cat_tabs_CTR) <- cat_vars
+
+for (cc in cat_vars) {
+  df_CTR_test[[paste0(cc, "_cnt")]] <- lookup_count(df_CTR_test[[cc]], cat_tabs_CTR[[cc]])
+}
+
+# logs
+df_CTR_test$campaign_cumcnt_log <- log1p(df_CTR_test$campaign_cumcnt)
+df_CTR_test$tslc_log <- log1p(df_CTR_test$tslc)
+df_CTR_test$cost_log <- log1p(df_CTR_test$cost)
+```
+
+# 6. CTR Modeling and Model selection
+
+## 6.1 Logistic regression
+
+Logistic regression is used because the response variables---click and conversion---are binary. The model produces valid probability estimates and allows interpretable coefficient-based analysis of how advertising cost, cumulative exposure, and user engagement history affect user responses. In addition, interaction terms can be naturally incorporated to capture heterogeneous effects.
+
+```{r}
+mod_ctr_baseline <- glm(
+  click ~ cost_log + has_prev_click + tslc_log + campaign_cumcnt_log +
+    cat1_cnt + cat2_cnt + cat3_cnt + cat4_cnt + cat5_cnt +
+    cat6_cnt + cat7_cnt + cat8_cnt + cat9_cnt,
+  data = df_CTR,
+  family = binomial
+)
+
+summary(mod_ctr_baseline)
+
+```
+
+```{r}
+#vif
+vif(mod_ctr_baseline)
+```
+
+## 6.2 Stepwise selection
+
+We first specify a baseline logistic regression model that includes all theoretically relevant covariates as a full model. To balance model interpretability and explanatory power, stepwise selection based on AIC is applied starting from the null model and using the baseline model as the upper scope. This approach allows us to retain statistically meaningful variables while avoiding unnecessary model complexity.
+
+```{r}
+null_ctr <- glm(click ~ 1, data = df_CTR, family = binomial)
+step_ctr <- step(null_ctr, scope = list(upper = formula(mod_ctr_baseline)), direction = "both")
+
+
+# 최종 
+
+summary(step_ctr)
+```
+
+The results indicate that higher advertising cost, prior click experience, and recent user engagement significantly increase the probability of a click. In contrast, longer time intervals since the last click reduce click likelihood, reflecting a temporal decay effect. These findings suggest that user engagement history plays a dominant role in explaining click behavior, beyond static campaign characteristics.
+
+```{r}
+
+vif(step_ctr)
+```
+
+## 6.3 Interaction terms
+
+Interaction terms were introduced to allow the effect of advertising cost to vary across user engagement states. In particular, interactions between cost and time since last click, as well as cost and prior click experience, capture heterogeneity in user responsiveness.
+
+```{r}
+step_ctr2 <- update(step_ctr, . ~ . + cost_log * tslc_log)
+step_ctr3 <- update(step_ctr2, . ~ . + cost_log * has_prev_click)  
+
+```
+
+Model comparison based on AIC shows that including these interaction terms improves model fit while maintaining parsimony, leading to the selection of the final interaction model.
+
+```{r}
+# AIC 
+AIC(step_ctr);AIC(step_ctr2);AIC(step_ctr3)
+
+# Final model 
+summary(step_ctr3)
+```
+
+
+For example, a one-unit increase in log(cost) increases the odds of a click by approximately exp(β), with a stronger effect for users with prior click experience.
+
+# 7. CTR evaluation
+
+AUC is used as the primary evaluation metric because it provides a threshold-independent measure of discriminative performance, which is particularly suitable under class imbalance. 
+
+
+## 7.1 Test AUC
+
+```{r}
+prob_ctr_test <- predict(step_ctr3, newdata = df_CTR_test, type = "response")
+roc_ctr <- roc(df_CTR_test$click, prob_ctr_test)
+auc(roc_ctr)
+
+```
+
+```{r pressure, echo=FALSE}
+plot(roc_ctr, main = "CTR: ROC Curve (Test Set)")
+```
+
+An AUC of 0.6987 indicates that the final model has reasonable discriminative power.
+
+## 7.3 VIF
+
+```{r}
+library(car)
+vif(step_ctr3)
+```
+
+Elevated VIF values are observed for interaction terms, which is expected due to deterministic relationships between main effects and interactions. Since coefficient signs remain stable and standard errors are interpretable, multicollinearity is not considered detrimental in this setting.
+
+# 8.CVR Train Preprocessing
+
+Modeling CTR and CVR separately reflects the sequential decision process of users: attention (click) followed by commitment (conversion). This decomposition allows different drivers to be identified at each stage, rather than conflating them into a single conversion model.
+
+## 8.1 CVR dataset construction
+
+```{r}
+df_CVR <- subset(df_train, click == 1)
+
+df_CVR <- df_CVR %>%
+  select(-conversion_timestamp, -conversion_id, -cpo,
+         -attribution, -click_pos, -click_nb, -time_since_last_click) %>%
+  arrange(timestamp)
+
+dim(df_CVR)
+
+```
+
+## 8.2 CVR feature engineering
+
+## 8.2.1 Campaign & user cumulative counts
+
+Raw campaign and user IDs carry no ordinal or behavioral meaning in CVR modeling. Therefore, cumulative exposure counts are introduced to quantify repeated campaign exposure and user interaction intensity prior to conversion.
+
+```{r}
+df_CVR$campaign_cumcnt <- ave(rep(1L, nrow(df_CVR)), df_CVR$campaign, FUN = cumsum) - 1L
+df_CVR$uid_cumcnt      <- ave(rep(1L, nrow(df_CVR)), df_CVR$uid,      FUN = cumsum) - 1L
+```
+
+## 8.2.2 Count encoding (train-based within CVR)
+
+```{r}
+for (cc in cat_vars) {
+  df_CVR[[paste0(cc, "_cnt")]] <- count_encode(df_CVR[[cc]])
+}
+```
+
+## 8.2.3 Log transforms
+
+```{r}
+df_CVR$campaign_cumcnt_log <- log1p(df_CVR$campaign_cumcnt)
+df_CVR$uid_cumcnt_log      <- log1p(df_CVR$uid_cumcnt)
+df_CVR$tslc_log            <- log1p(df_CVR$tslc)
+df_CVR$cost_log            <- log1p(df_CVR$cost)
+```
+
+## 9. CVR test preprocessing (click==1 only; train maps)
+
+```{r}
+df_CVR_test <- subset(df_test, click == 1) %>%
+  arrange(timestamp) %>%
+  select(-conversion_timestamp, -conversion_id, -cpo,
+         -attribution, -click_pos, -click_nb, -time_since_last_click)
+
+# align factor levels to CVR train
+df_CVR_test$campaign       <- factor(df_CVR_test$campaign, levels = levels(df_CVR$campaign))
+df_CVR_test$uid            <- factor(df_CVR_test$uid,      levels = levels(df_CVR$uid))
+df_CVR_test$has_prev_click <- factor(df_CVR_test$has_prev_click, levels = levels(df_CVR$has_prev_click))
+
+for (cc in cat_vars) {
+  df_CVR_test[[cc]] <- factor(df_CVR_test[[cc]], levels = levels(df_CVR[[cc]]))
+}
+
+# cumcnt on test
+df_CVR_test$campaign_cumcnt <- ave(rep(1L, nrow(df_CVR_test)),
+                                   df_CVR_test$campaign, FUN = cumsum) - 1L
+df_CVR_test$uid_cumcnt <- ave(rep(1L, nrow(df_CVR_test)),
+                              df_CVR_test$uid, FUN = cumsum) - 1L
+
+# train-based frequency tables from df_CVR
+cat_tabs_CVR <- lapply(df_CVR[cat_vars], make_count_tab)
+names(cat_tabs_CVR) <- cat_vars
+
+for (cc in cat_vars) {
+  df_CVR_test[[paste0(cc, "_cnt")]] <- lookup_count(df_CVR_test[[cc]], cat_tabs_CVR[[cc]])
+}
+
+# logs
+df_CVR_test$campaign_cumcnt_log <- log1p(df_CVR_test$campaign_cumcnt)
+df_CVR_test$uid_cumcnt_log      <- log1p(df_CVR_test$uid_cumcnt)
+df_CVR_test$tslc_log            <- log1p(df_CVR_test$tslc)
+df_CVR_test$cost_log            <- log1p(df_CVR_test$cost)
+```
+
+# 10. CVR Modeling and Model selection
+
+## 10.1 CVR Logistic regression
+
+```{r}
+mod_cvr_baseline <- glm(
+  conversion ~ cost_log + tslc_log + has_prev_click +
+    uid_cumcnt_log + campaign_cumcnt_log +
+    cat1_cnt + cat2_cnt + cat3_cnt + cat4_cnt + cat5_cnt +
+    cat6_cnt + cat7_cnt + cat8_cnt + cat9_cnt,
+  data = df_CVR,
+  family = binomial
+)
+
+summary(mod_cvr_baseline)
+
+
+```
+
+## 10.1.2 step-wise
+
+```{r}
+null_cvr <- glm(conversion ~ 1, data = df_CVR, family = binomial)
+step_cvr <- step(null_cvr, scope = list(upper = formula(mod_cvr_baseline)), direction = "both")
+
+summary(step_cvr)
+```
+
+```{r}
+vif(step_cvr)
+```
+## 10.1.3 Interaction Terms
+
+```{r}
+# interactions (as in your script)
+step_cvr2 <- update(step_cvr, . ~ . + has_prev_click * cost_log)
+step_cvr3 <- update(step_cvr2, . ~ . + has_prev_click * uid_cumcnt_log) # final candidate
+```
+
+
+AIC check 
+```{r}
+# AIC 
+AIC(step_cvr);AIC(step_cvr2);AIC(step_cvr3)
+
+# Final model 
+summary(step_cvr2)
+
+```
+# 11.CVR evaluation
+
+
+## 11.1 Test AUC
+
+```{r}
+prob_cvr_test <- predict(step_cvr2, newdata = df_CVR_test, type = "response")
+roc_cvr <- roc(df_CVR_test$conversion, prob_cvr_test)
+auc(roc_cvr)
+plot(roc_cvr, main = "CVR: ROC Curve (Test Set)")
+```
+
+# 12. Marginal Effects & Interpretation
+
+Since logistic regression coefficients are expressed in log-odds, direct interpretation in terms of probability changes is not straightforward. Therefore, this study uses Average Marginal Effects to interpret the impact of covariates on click and conversion probabilities on the probability scale. Marginal effects provide a clear and intuitive measure of effect size, particularly in models with interaction terms.
+
+```{r}
+margins(step_ctr3); margins(step_cvr2)
+```
+
+
+
+
+## 13. Limits and Future Work
+
+This study does not explicitly model within-user dependence or unobserved heterogeneity. Future work could extend the analysis using mixed-effects models to account for repeated user-level observations, or survival-based approaches to directly model time-to-conversion dynamics.
+
+Although stepwise selection is known to suffer from selection bias and instability, it is used here as an exploratory tool to identify a parsimonious model. To mitigate these limitations, model performance is evaluated not only through AIC but also test-set AUC.
+
+
+# 14. Conclusion
+
+By jointly analyzing CTR and click-conditional CVR through marginal effects, this study shows that advertising cost and prior engagement are key drivers of user response, but their effects are highly heterogeneous. Cost increases are most effective for recently engaged users, while excessive repeated exposure reduces conversion probability, emphasizing the importance of engagement-aware and stage-specific budget allocation in online advertising. This suggests that optimal budget allocation should prioritize recently engaged users at the CTR stage, while avoiding excessive exposure at the CVR stage to mitigate fatigue effects.	
+
